@@ -1092,7 +1092,7 @@ function parseSkeleton(buffer, view, bytesOffset, geoPackage, version) {
         let res = parseString(buffer, view, bytesOffset);
         let geometryName = res.string;
         bytesOffset = res.bytesOffset;
-        let align = res.length % 4;
+        let align = bytesOffset % 4;
         if(align !== 0){
             bytesOffset += (4 - align);
         }
@@ -1198,13 +1198,15 @@ function parseSkeleton(buffer, view, bytesOffset, geoPackage, version) {
 function parseTexturePackage(buffer, view, bytesOffset, texturePackage, version) {
     let size = view.getUint32(bytesOffset, true);
     bytesOffset += Uint32Array.BYTES_PER_ELEMENT;
+    let startOffset = bytesOffset;
+    let endBytesOffset = startOffset + size;
     let count = view.getUint32(bytesOffset, true);
     bytesOffset += Uint32Array.BYTES_PER_ELEMENT;
     for(let i = 0; i < count; i++){
         let res = parseString(buffer, view, bytesOffset);
         let textureCode = res.string;
         bytesOffset = res.bytesOffset;
-        let align = res.length % 4;
+        let align = (bytesOffset - startOffset) % 4;
         if(align !== 0){
             bytesOffset += (4 - align);
         }
@@ -1251,7 +1253,7 @@ function parseTexturePackage(buffer, view, bytesOffset, texturePackage, version)
         };
     }
 
-    return bytesOffset;
+    return endBytesOffset;
 }
 
 function parseMaterial(buffer, view, bytesOffset, result) {
@@ -1308,21 +1310,19 @@ function parsePickInfo(buffer, view, bytesOffset, nOptions, geoPackage, version)
                     bytesOffset += Uint32Array.BYTES_PER_ELEMENT;
                     let nSize = view.getUint32(bytesOffset, true);
                     bytesOffset += Uint32Array.BYTES_PER_ELEMENT;
-                    let infos = [];
+                    let vertexCount = 0, vertexColorOffset = 0;
+                    pickInfo[nDictID] = {
+                        batchId: j
+                    };
                     for(let k = 0; k < nSize; k++){
-                        let vertexColorOffset = view.getUint32(bytesOffset, true);
+                        vertexColorOffset = view.getUint32(bytesOffset, true);
                         bytesOffset += Uint32Array.BYTES_PER_ELEMENT;
-                        let vertexCount = view.getUint32(bytesOffset, true);
+                        vertexCount = view.getUint32(bytesOffset, true);
                         bytesOffset += Uint32Array.BYTES_PER_ELEMENT;
                         batchIds.fill(j, vertexColorOffset, vertexColorOffset + vertexCount);
-                        infos.push({
-                            vertexColorOffset: vertexColorOffset,
-                            vertexColorCount: vertexCount,
-                            batchId:j
-                        });
                     }
-
-                    pickInfo[nDictID] = infos;
+                    pickInfo[nDictID].vertexColorOffset = vertexColorOffset;
+                    pickInfo[nDictID].vertexCount = vertexCount;
                 }
                 createBatchIdAttribute(geoPackage[geometryName].vertexPackage,batchIds,undefined);
             }else{

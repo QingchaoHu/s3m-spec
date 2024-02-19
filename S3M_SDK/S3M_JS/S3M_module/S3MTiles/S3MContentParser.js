@@ -2,13 +2,16 @@ import DDSTexture from './DDSTexture.js';
 import MaterialPass from './MaterialPass.js';
 import S3MContentFactory from './Factory/S3MContentFactory.js';
 import VertexCompressOption from './Enum/VertexCompressOption.js';
+import CRNTranscoder from "./Core/CRNTranscoder.js";
+import S3MPixelFormat from './Enum/S3MPixelFormat.js';
 
 function S3MContentParser(){
 
 }
 
-function parseMaterial(context, content, tile) {
+async function parseMaterial(context, content, tile) {
     let materialTable = {};
+    let readyPromises = [];
     let materials = Cesium.defaultValue(content.materials.material, content.materials.materials);
     for(let i = 0,j = materials.length;i < j;i++){
         let material = materials[i].material;
@@ -39,40 +42,36 @@ function parseMaterial(context, content, tile) {
                 textureInfo.wrapT = wrapT;
                 let keyword = tile.fileName + textureCode;
                 let texture = context.textureCache.getTexture(keyword);
+                materialPass._RGBTOBGR = textureInfo.nFormat === S3MPixelFormat.ABGR;
                 if(!Cesium.defined(texture)){
-                    if(Cesium.PixelFormat.isCompressedFormat(textureInfo.internalFormat)){
-                        texture = new DDSTexture(context, textureCode, textureInfo);
+                    textureInfo.isTexBlock = false;
+                    switch (textureInfo.compressType) {
+                        case S3MPixelFormat.CRN_DXT5: 
+                            const compressedBuffer = CRNTranscoder.transcode({
+                                data: textureInfo.arrayBufferView,
+                                bMipMap : true
+                            });
+                            textureInfo.arrayBufferView = compressedBuffer.bufferView;
+                            texture = new DDSTexture(context, textureCode, textureInfo);
+                            context.textureCache.addTexture(keyword, texture);
+                            break;
+                        case S3MPixelFormat.WEBP:
+                            readyPromises.push(materialPass.createWebp(keyword, context, textureInfo));
+                            break;
+                        default: 
+                            texture = new DDSTexture(context, textureCode, textureInfo);
+                            context.textureCache.addTexture(keyword, texture);
+                            break;
                     }
-                    else{
-                        let isPowerOfTwo = Cesium.Math.isPowerOfTwo(textureInfo.width) && Cesium.Math.isPowerOfTwo(textureInfo.height);
-                        texture = new Cesium.Texture({
-                            context : context,
-                            source : {
-                                width : textureInfo.width,
-                                height : textureInfo.height,
-                                arrayBufferView : textureInfo.arrayBufferView
-                            },
-                            sampler : new Cesium.Sampler({
-                                minificationFilter : isPowerOfTwo ? context._gl.LINEAR_MIPMAP_LINEAR : context._gl.LINEAR,
-                                wrapS : wrapS,
-                                wrapT : wrapT
-                            })
-                        });
-
-                        if(isPowerOfTwo){
-                            texture.generateMipmap(Cesium.MipmapHint.NICEST);
-                        }
-                    }
-
-                    context.textureCache.addTexture(keyword, texture);
                 }
-
-                materialPass.textures.push(texture);
+                texture && materialPass.textures.push(texture);
             }
         }
     }
 
-    return materialTable;
+    return Promise.all(readyPromises).then(()=>{
+        return materialTable
+    })
 }
 
 function calcBoundingVolumeForNormal(vertexPackage, modelMatrix){
@@ -134,6 +133,44 @@ function calcBoundingVolume(vertexPackage, modelMatrix) {
     return calcBoundingVolumeForNormal(vertexPackage, modelMatrix);
 }
 
+function createBoundingBox(box, transform) {
+    if(box.center){
+        const halfAxes = new Cesium.Matrix3();
+        const center = new Cesium.Cartesian3(box.center.x, box.center.y, box.center.z);
+        Cesium.Matrix4.multiplyByPoint(transform, center, center);
+
+        const vx = new Cesium.Cartesian4(box.xExtent.x, box.xExtent.y, box.xExtent.z, 0);
+        const vy = new Cesium.Cartesian4(box.yExtent.x, box.yExtent.y, box.yExtent.z, 0);
+        const vz = new Cesium.Cartesian4(box.zExtent.x, box.zExtent.y, box.zExtent.z, 0);
+
+        Cesium.Matrix4.multiplyByVector(transform, vx, vx);
+        Cesium.Matrix4.multiplyByVector(transform, vy, vy);
+        Cesium.Matrix4.multiplyByVector(transform, vz, vz);
+
+        Cesium.Matrix3.setColumn(halfAxes, 0, vx, halfAxes);
+        Cesium.Matrix3.setColumn(halfAxes, 1, vy, halfAxes);
+        Cesium.Matrix3.setColumn(halfAxes, 2, vz, halfAxes);
+        return new Cesium.TileOrientedBoundingBox(center, halfAxes);
+    }
+
+    const points = [];
+    points.push(new Cesium.Cartesian3(box.min.x, box.min.y, box.min.z));
+    points.push(new Cesium.Cartesian3(box.min.x, box.min.y, box.max.z));
+    points.push(new Cesium.Cartesian3(box.min.x, box.max.y, box.min.z));
+    points.push(new Cesium.Cartesian3(box.min.x, box.max.y, box.max.z));
+    points.push(new Cesium.Cartesian3(box.max.x, box.min.y, box.min.z));
+    points.push(new Cesium.Cartesian3(box.max.x, box.min.y, box.max.z));
+    points.push(new Cesium.Cartesian3(box.max.x, box.max.y, box.min.z));
+    points.push(new Cesium.Cartesian3(box.max.x, box.max.y, box.max.z));
+
+    for(let i = 0; i < 8; i++){
+        points[i] = Cesium.Matrix4.multiplyByPoint(transform, points[i], points[i]);
+    }
+
+    const orientedBoundingBox = Cesium.OrientedBoundingBox.fromPoints(points);
+    return new Cesium.TileOrientedBoundingBox(orientedBoundingBox.center, orientedBoundingBox.halfAxes);
+}
+
 function parseGeodes(layer, content, materialTable, pagelodNode, pagelod) {
     let geodeList = pagelodNode.geodes;
     for(let i = 0,j = geodeList.length;i < j;i++){
@@ -142,8 +179,12 @@ function parseGeodes(layer, content, materialTable, pagelodNode, pagelod) {
         let modelMatrix = Cesium.Matrix4.multiply(layer.modelMatrix, geoMatrix, new Cesium.Matrix4());
         let boundingSphere;
         if(Cesium.defined(pagelod.boundingVolume)) {
-            boundingSphere = new Cesium.BoundingSphere(pagelod.boundingVolume.sphere.center, pagelod.boundingVolume.sphere.radius);
-            Cesium.BoundingSphere.transform(boundingSphere, layer.modelMatrix, boundingSphere);
+            if(Cesium.defined(pagelod.boundingVolume.obb)){
+                boundingSphere = createBoundingBox(pagelod.boundingVolume.obb, layer.modelMatrix)._boundingSphere;
+            }else{
+                boundingSphere = new Cesium.BoundingSphere(pagelod.boundingVolume.sphere.center, pagelod.boundingVolume.sphere.radius);
+                Cesium.BoundingSphere.transform(boundingSphere, layer.modelMatrix, boundingSphere);
+            }
         }
         
         let skeletonNames = geodeNode.skeletonNames;
@@ -222,13 +263,13 @@ function parsePagelods(layer, content, materialTable) {
     return pagelods;
 }
 
-S3MContentParser.parse = function(layer, content, tile) {
+S3MContentParser.parse = async function(layer, content, tile) { 
     if(!Cesium.defined(content)) {
         return ;
     }
 
     layer.dataVersion = content.version;
-    let materialTable =  parseMaterial(layer.context, content, tile);
+    let materialTable = await parseMaterial(layer.context, content, tile);
     let pagelods =  parsePagelods(layer, content, materialTable);
 
     return pagelods;
